@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TCP Connection Duration</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@1.4.0"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 40px;
+      background-color: #f9f9f9;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    h2 {
+      margin-top: 50px;
+    }
+    canvas {
+      margin-bottom: 30px;
+    }
+    input, button {
+      margin: 10px 5px 10px 0;
+    }
+    .stats {
+      background-color: #eee;
+      padding: 15px;
+      border-radius: 5px;
+      margin-bottom: 20px;
+    }
+    .stats-section {
+      margin-bottom: 15px;
+    }
+    .connection-log {
+      margin-top: 30px;
+      max-height: 400px;
+      overflow-y: auto;
+      border: 1px solid #ccc;
+      padding: 10px;
+      background-color: #f5f5f5;
+    }
+    .connection-log-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    .connection-log-table th, .connection-log-table td {
+      padding: 8px;
+      text-align: left;
+      border-bottom: 1px solid #ddd;
+    }
+    .connection-log-table th {
+      background-color: #f2f2f2;
+      position: sticky;
+      top: 0;
+    }
+    .connection-log-table tr:nth-child(even) {
+      background-color: #f9f9f9;
+    }
+    .connection-log-table tr:hover {
+      background-color: #e9e9e9;
+    }
+    .button-group {
+      margin: 10px 0;
+    }
+    .toggle-log {
+      margin-top: 10px;
+    }
+    .during-attack {
+      background-color: #ffeeee !important;
+    }
+    .completed {
+      color: green;
+    }
+    .incomplete {
+      color: red;
+    }
+  </style>
+</head>
+<body>
+  <!--
+    TCP Connection Duration Visualizer with Detailed Logs
+    David Xiao
+    Description:
+      This web application analyzes tcpdump logs to visualize TCP connection durations.
+      It calculates the time between initial SYN and connection termination (FIN-ACK or RESET).
+      Connections that don't properly terminate are assigned 200s duration.
+      
+      The chart displays:
+      - Red line: Start of attack (30s)
+      - Green line: End of attack (150s)
+      
+      Statistics are calculated for:
+      - Overall connections
+      - Attack period connections (30-150s)
+      
+      A detailed log of all connections is included for verification.
+  -->
+  
+  <h2>Upload TCP Dump (SYN Cookies OFF)</h2>
+  <div class="button-group">
+    <input type="file" id="offInput" accept=".txt">
+    <button id="exportOff">Export Chart</button>
+    <button id="exportLogOff">Export Connection Log</button>
+  </div>
+  <div id="statsOff" class="stats">Upload a file to see statistics.</div>
+  <canvas id="cookiesOffChart" width="800" height="400"></canvas>
+  <button class="toggle-log" id="toggleLogOff">Show Connection Details</button>
+  <div class="connection-log" id="connectionLogOff" style="display:none;"></div>
+
+  <h2>Upload TCP Dump (SYN Cookies ON)</h2>
+  <div class="button-group">
+    <input type="file" id="onInput" accept=".txt">
+    <button id="exportOn">Export Chart</button>
+    <button id="exportLogOn">Export Connection Log</button>
+  </div>
+  <div id="statsOn" class="stats">Upload a file to see statistics.</div>
+  <canvas id="cookiesOnChart" width="800" height="400"></canvas>
+  <button class="toggle-log" id="toggleLogOn">Show Connection Details</button>
+  <div class="connection-log" id="connectionLogOn" style="display:none;"></div>
+
+  <script>
+    let chartRefs = {};
+    let connectionLogs = {};
+    
+    // Constants for attack window
+    const ATTACK_START = 30;  // seconds
+    const ATTACK_END = 150;   // seconds
+
+    // Function to parse time string into seconds
+    function parseTimeToSeconds(timeStr) {
+      const [hourStr, minStr, secStr] = timeStr.split(':');
+      const hours = parseInt(hourStr, 10);
+      const minutes = parseInt(minStr, 10);
+      const seconds = parseFloat(secStr);
+      return hours * 3600 + minutes * 60 + seconds;
+    }
+
+    // Function to format seconds back to readable time
+    function formatTime(seconds) {
+      const hours = Math.floor(seconds / 3600);
+      const minutes = Math.floor((seconds % 3600) / 60);
+      const secs = (seconds % 60).toFixed(6);
+      return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${secs.padStart(9, '0')}`;
+    }
+
+    // Function to parse tcpdump output and extract connection timings
+    function parseTcpDump(content) {
+      const lines = content.split('\n');
+      const connections = new Map();
+      const connectionStates = new Map();
+      const connectionEvents = new Map();  // Track events for each connection
+
+      // Unique key for each TCP connection using 4-tuple
+      function getKey(src, sport, dst, dport) {
+        return [src, sport, dst, dport].join(':');
+      }
+      
+      // Bidirectional key to handle packets in both directions of same connection
+      function getBidirectionalKey(src, sport, dst, dport) {
+        const key1 = getKey(src, sport, dst, dport);
+        const key2 = getKey(dst, dport, src, sport);
+        return connections.has(key1) ? key1 : 
+               connections.has(key2) ? key2 : key1;
+      }
+
+      lines.forEach(line => {
+        if (!line.trim()) return;
+        
+        try {
+          // Extract timestamp and IP information with detailed flags
+          // Example: 20:29:06.051933 IP 5.6.7.8.80 > 1.1.2.3.58290: Flags [S.], seq ...
+          const match = line.match(/(\d{2}:\d{2}:\d{2}\.\d+) IP (\d+\.\d+\.\d+\.\d+)\.(\d+) > (\d+\.\d+\.\d+\.\d+)\.(\d+): Flags \[(.*?)],/);
+          
+          if (!match) return;
+          
+          const [_, timeStr, src, sport, dst, dport, flags] = match;
+          const timestamp = parseTimeToSeconds(timeStr);
+          const bidirectionalKey = getBidirectionalKey(src, sport, dst, dport);
+          const direction = getKey(src, sport, dst, dport) === bidirectionalKey ? 'outgoing' : 'incoming';
+          
+          // Initialize event tracking if not exists
+          if (!connectionEvents.has(bidirectionalKey)) {
+            connectionEvents.set(bidirectionalKey, []);
+          }
+          
+          // Add event to log
+          connectionEvents.get(bidirectionalKey).push({
+            timestamp,
+            timeStr,
+            src: `${src}:${sport}`,
+            dst: `${dst}:${dport}`,
+            flags,
+            direction
+          });
+          
+          // Initial SYN to start connection
+          if (flags.includes('S') && !flags.includes('.') && !connections.has(bidirectionalKey)) {
+            connections.set(bidirectionalKey, { 
+              start: timestamp, 
+              startTimeStr: timeStr,
+              end: null,
+              endTimeStr: null,
+              sourceKey: getKey(src, sport, dst, dport),
+              destKey: getKey(dst, dport, src, sport),
+              sourceAddr: `${src}:${sport}`,
+              destAddr: `${dst}:${dport}`
+            });
+            connectionStates.set(bidirectionalKey, { 
+              finSent: false, 
+              finAcked: false,
+              resetSeen: false
+            });
+          } 
+          // Track connection state
+          else if (connections.has(bidirectionalKey)) {
+            const conn = connections.get(bidirectionalKey);
+            const state = connectionStates.get(bidirectionalKey);
+            
+            // Handle RST (immediate termination)
+            if (flags.includes('R')) {
+              state.resetSeen = true;
+              conn.end = timestamp;
+              conn.endTimeStr = timeStr;
+              conn.terminationType = 'RESET';
+            } 
+            // Track FIN flag
+            else if (flags.includes('F')) {
+              state.finSent = true;
+              state.lastFinTime = timestamp;
+              state.lastFinTimeStr = timeStr;
+            } 
+            // If we've seen a FIN and this is an ACK, mark as terminated
+            else if (flags === '.' && state.finSent && !state.resetSeen) {
+              // Only count as terminated if we haven't already
+              if (!conn.end) {
+                conn.end = timestamp;
+                conn.endTimeStr = timeStr;
+                conn.terminationType = 'FIN-ACK';
+              }
+            }
+          }
+        } catch (e) {
+          console.error("Error parsing line:", line, e);
+        }
+      });
+
+      // Normalize times relative to earliest start time
+      let firstStart = Infinity;
+      connections.forEach(conn => {
+        if (conn.start < firstStart) {
+          firstStart = conn.start;
+        }
+      });
+      
+      // Overall statistics
+      let totalConnections = 0;
+      let completedConnections = 0;
+      let incompleteConnections = 0;
+      
+      // Attack period statistics
+      let attackConnections = 0;
+      let attackCompletedConnections = 0;
+      let attackIncompleteConnections = 0;
+      
+      // Format for charting and calculate statistics
+      const connDetailsArray = [];
+      const dataPoints = Array.from(connections.entries()).map(([key, conn]) => {
+        const normalizedStartTime = conn.start - firstStart;
+        const duration = conn.end !== null ? conn.end - conn.start : 200; // 200s for incomplete
+        const isCompleted = conn.end !== null;
+        
+        // Update overall statistics
+        totalConnections++;
+        if (isCompleted) {
+          completedConnections++;
+        } else {
+          incompleteConnections++;
+        }
+        
+        // Update attack period statistics (connections that started during attack)
+        const duringAttack = normalizedStartTime >= ATTACK_START && normalizedStartTime <= ATTACK_END;
+        if (duringAttack) {
+          attackConnections++;
+          if (isCompleted) {
+            attackCompletedConnections++;
+          } else {
+            attackIncompleteConnections++;
+          }
+        }
+        
+        // Create a detailed entry for the connection log
+        const events = connectionEvents.get(key) || [];
+        connDetailsArray.push({
+          key,
+          sourceAddr: conn.sourceAddr,
+          destAddr: conn.destAddr,
+          startTime: conn.startTimeStr,
+          normalizedStartTime,
+          endTime: conn.endTimeStr || 'Not terminated',
+          duration: duration.toFixed(6),
+          status: isCompleted ? 'Completed' : 'Incomplete (200s)',
+          terminationType: conn.terminationType || 'N/A',
+          duringAttack,
+          events
+        });
+        
+        return {
+          x: normalizedStartTime,
+          y: duration,
+          status: isCompleted ? 'complete' : 'incomplete (200s)',
+          duringAttack: duringAttack
+        };
+      });
+
+      // Sort connections by start time
+      connDetailsArray.sort((a, b) => a.normalizedStartTime - b.normalizedStartTime);
+
+      return {
+        dataPoints,
+        connDetails: connDetailsArray,
+        stats: {
+          total: totalConnections,
+          completed: completedConnections,
+          incomplete: incompleteConnections,
+          attackTotal: attackConnections,
+          attackCompleted: attackCompletedConnections,
+          attackIncomplete: attackIncompleteConnections
+        }
+      };
+    }
+
+    // Generate HTML for connection log table
+    function generateConnectionLogTable(connections) {
+      let html = `
+        <table class="connection-log-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Source</th>
+              <th>Destination</th>
+              <th>Start Time</th>
+              <th>Norm. Start</th>
+              <th>End Time</th>
+              <th>Duration (s)</th>
+              <th>Status</th>
+              <th>Term. Type</th>
+              <th>Attack?</th>
+              <th>Details</th>
+            </tr>
+          </thead>
+          <tbody>
+      `;
+      
+      connections.forEach((conn, index) => {
+        const rowClass = conn.duringAttack ? 'during-attack' : '';
+        const statusClass = conn.status.includes('Completed') ? 'completed' : 'incomplete';
+        
+        html += `
+          <tr class="${rowClass}">
+            <td>${index + 1}</td>
+            <td>${conn.sourceAddr}</td>
+            <td>${conn.destAddr}</td>
+            <td>${conn.startTime}</td>
+            <td>${conn.normalizedStartTime.toFixed(6)}</td>
+            <td>${conn.endTime}</td>
+            <td>${conn.duration}</td>
+            <td class="${statusClass}">${conn.status}</td>
+            <td>${conn.terminationType}</td>
+            <td>${conn.duringAttack ? 'Yes' : 'No'}</td>
+            <td><button onclick="showEvents('${conn.key}')">Events</button></td>
+          </tr>
+        `;
+      });
+      
+      html += `
+          </tbody>
+        </table>
+        <div id="eventDetails" style="display:none; margin-top:20px; border:1px solid #ddd; padding:10px;"></div>
+      `;
+      
+      return html;
+    }
+
+    // Render connection log table
+    function renderConnectionLog(logId, connections) {
+      const logElement = document.getElementById(logId);
+      logElement.innerHTML = generateConnectionLogTable(connections);
+    }
+
+    // Function to show packet events for a connection
+    function showEvents(connKey) {
+      const targetLog = connectionLogs.offDetails?.find(c => c.key === connKey) || 
+                        connectionLogs.onDetails?.find(c => c.key === connKey);
+      
+      if (!targetLog) return;
+      
+      let eventsHtml = `
+        <h3>Packet Events for Connection ${targetLog.sourceAddr} → ${targetLog.destAddr}</h3>
+        <table class="connection-log-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Time</th>
+              <th>Direction</th>
+              <th>Source</th>
+              <th>Destination</th>
+              <th>Flags</th>
+            </tr>
+          </thead>
+          <tbody>
+      `;
+      
+      targetLog.events.forEach((event, index) => {
+        eventsHtml += `
+          <tr>
+            <td>${index + 1}</td>
+            <td>${event.timeStr}</td>
+            <td>${event.direction}</td>
+            <td>${event.src}</td>
+            <td>${event.dst}</td>
+            <td>[${event.flags}]</td>
+          </tr>
+        `;
+      });
+      
+      eventsHtml += `
+          </tbody>
+        </table>
+        <button onclick="document.getElementById('eventDetails').style.display='none'">Close</button>
+      `;
+      
+      const detailsElement = document.getElementById('eventDetails');
+      detailsElement.innerHTML = eventsHtml;
+      detailsElement.style.display = 'block';
+      
+      // Scroll to the element
+      detailsElement.scrollIntoView({ behavior: 'smooth' });
+    }
+
+    // Make showEvents available globally
+    window.showEvents = showEvents;
+
+    // Renders chart with Chart.js
+    function buildChart(canvasId, label, data, statsId) {
+      const ctx = document.getElementById(canvasId).getContext('2d');
+      if (chartRefs[canvasId]) chartRefs[canvasId].destroy();
+
+      // Calculate completion rates
+      const overallCompletionRate = data.stats.total > 0 ? 
+          (data.stats.completed / data.stats.total * 100).toFixed(2) : "0.00";
+      
+      const attackCompletionRate = data.stats.attackTotal > 0 ? 
+          (data.stats.attackCompleted / data.stats.attackTotal * 100).toFixed(2) : "0.00";
+
+      // Update statistics display
+      const statsElement = document.getElementById(statsId);
+      statsElement.innerHTML = `
+        <div class="stats-section">
+          <strong>Overall Connection Statistics:</strong><br>
+          Total Connections: ${data.stats.total}<br>
+          Completed Connections: ${data.stats.completed}<br>
+          Incomplete Connections: ${data.stats.incomplete}<br>
+          Completion Rate: ${overallCompletionRate}%
+        </div>
+        <div class="stats-section">
+          <strong>Attack Period Statistics (${ATTACK_START}s-${ATTACK_END}s):</strong><br>
+          Connections During Attack: ${data.stats.attackTotal}<br>
+          Completed During Attack: ${data.stats.attackCompleted}<br>
+          Incomplete During Attack: ${data.stats.attackIncomplete}<br>
+          Attack Period Completion Rate: ${attackCompletionRate}%
+        </div>
+      `;
+
+      chartRefs[canvasId] = new Chart(ctx, {
+        type: 'scatter',
+        data: {
+          datasets: [{
+            label,
+            data: data.dataPoints,
+            backgroundColor: data.dataPoints.map(p => {
+              // Color points differently based on completion and attack period
+              if (p.duringAttack) {
+                return p.status === 'complete' ? 'rgba(0, 128, 0, 0.7)' : 'rgba(255, 0, 0, 0.7)';
+              } else {
+                return p.status === 'complete' ? 'rgba(75, 192, 192, 0.6)' : 'rgba(255, 99, 132, 0.6)';
+              }
+            }),
+            pointRadius: data.dataPoints.map(p => p.duringAttack ? 5 : 4),
+            pointBorderWidth: data.dataPoints.map(p => p.duringAttack ? 1 : 0.5)
+          }]
+        },
+        options: {
+          scales: {
+            x: {
+              title: {
+                display: true,
+                text: 'Connection Start Time (seconds)'
+              }
+            },
+            y: {
+              title: {
+                display: true,
+                text: 'Duration (seconds)'
+              }
+            }
+          },
+          plugins: {
+            annotation: {
+              annotations: {
+                // Visual markers for attack window
+                attackStart: {
+                  type: 'line',
+                  xMin: ATTACK_START,
+                  xMax: ATTACK_START,
+                  borderColor: 'red',
+                  borderWidth: 2,
+                  label: {
+                    enabled: true,
+                    content: 'Attack Start'
+                  }
+                },
+                attackEnd: {
+                  type: 'line',
+                  xMin: ATTACK_END,
+                  xMax: ATTACK_END,
+                  borderColor: 'green',
+                  borderWidth: 2,
+                  label: {
+                    enabled: true,
+                    content: 'Attack End'
+                  }
+                },
+                // Highlight attack region
+                attackRegion: {
+                  type: 'box',
+                  xMin: ATTACK_START,
+                  xMax: ATTACK_END,
+                  yMin: 0,
+                  yMax: 'max',
+                  backgroundColor: 'rgba(255, 0, 0, 0.05)',
+                  borderWidth: 0
+                }
+              }
+            },
+            tooltip: {
+              callbacks: {
+                label: ctx => {
+                  const attackStatus = ctx.raw.duringAttack ? ' (During Attack)' : '';
+                  return `Start: ${ctx.parsed.x.toFixed(2)}s, Duration: ${ctx.parsed.y.toFixed(2)}s, ${ctx.raw.status}${attackStatus}`;
+                }
+              }
+            },
+            legend: {
+              labels: {
+                generateLabels: (chart) => {
+                  const datasets = chart.data.datasets;
+                  return [{
+                    text: `${label} (All Connections: ${data.stats.total})`,
+                    fillStyle: 'rgba(75, 192, 192, 0.6)',
+                    hidden: false
+                  }, {
+                    text: `During Attack (${data.stats.attackTotal} connections)`,
+                    fillStyle: 'rgba(0, 128, 0, 0.7)',
+                    hidden: false
+                  }];
+                }
+              }
+            }
+          },
+          animation: {
+            duration: 1000
+          }
+        },
+        plugins: [Chart.registry.getPlugin('annotation')]
+      });
+    }
+
+    // Export the chart as an image
+    function exportChart(canvasId, filename) {
+      const canvas = document.getElementById(canvasId);
+      const link = document.createElement('a');
+      link.download = filename;
+      link.href = canvas.toDataURL();
+      link.click();
+    }
+
+    // Export connection log as CSV
+    function exportConnectionLog(connections, filename) {
+      // Create CSV header
+      let csv = "Number,Source,Destination,Start Time,Normalized Start,End Time,Duration (s),Status,Termination Type,During Attack\n";
+      
+      // Add each connection as a row
+      connections.forEach((conn, index) => {
+        csv += `${index + 1},${conn.sourceAddr},${conn.destAddr},${conn.startTime},${conn.normalizedStartTime.toFixed(6)},${conn.endTime},${conn.duration},"${conn.status}",${conn.terminationType},${conn.duringAttack ? 'Yes' : 'No'}\n`;
+      });
+      
+      // Create download link
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = filename;
+      link.click();
+    }
+
+    // Binds file upload inputs to chart generation
+    function handleFileUpload(inputId, canvasId, label, statsId, logId, type) {
+      const input = document.getElementById(inputId);
+      input.addEventListener('change', e => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        const reader = new FileReader();
+        reader.onload = () => {
+          const result = parseTcpDump(reader.result);
+          buildChart(canvasId, label, result, statsId);
+          renderConnectionLog(logId, result.connDetails);
+          
+          // Store connection details for later use
+          connectionLogs[`${type}Details`] = result.connDetails;
+        };
+        reader.readAsText(file);
+      });
+    }
+
+    // Toggle connection log visibility
+    function setupToggleLog(toggleId, logId) {
+      const toggleButton = document.getElementById(toggleId);
+      const logElement = document.getElementById(logId);
+      
+      toggleButton.addEventListener('click', () => {
+        if (logElement.style.display === 'none') {
+          logElement.style.display = 'block';
+          toggleButton.textContent = 'Hide Connection Details';
+        } else {
+          logElement.style.display = 'none';
+          toggleButton.textContent = 'Show Connection Details';
+        }
+      });
+    }
+
+    // Attach handlers to both inputs
+    handleFileUpload('offInput', 'cookiesOffChart', 'SYN Cookies OFF', 'statsOff', 'connectionLogOff', 'off');
+    handleFileUpload('onInput', 'cookiesOnChart', 'SYN Cookies ON', 'statsOn', 'connectionLogOn', 'on');
+
+    // Setup toggle buttons
+    setupToggleLog('toggleLogOff', 'connectionLogOff');
+    setupToggleLog('toggleLogOn', 'connectionLogOn');
+
+    // Export buttons for charts
+    document.getElementById('exportOff').addEventListener('click', () => {
+      exportChart('cookiesOffChart', 'syn_cookies_off_chart.png');
+    });
+
+    document.getElementById('exportOn').addEventListener('click', () => {
+      exportChart('cookiesOnChart', 'syn_cookies_on_chart.png');
+    });
+    
+    // Export buttons for logs
+    document.getElementById('exportLogOff').addEventListener('click', () => {
+      if (connectionLogs.offDetails) {
+        exportConnectionLog(connectionLogs.offDetails, 'syn_cookies_off_connections.csv');
+      } else {
+        alert('No connection data available. Please upload a file first.');
+      }
+    });
+    
+    document.getElementById('exportLogOn').addEventListener('click', () => {
+      if (connectionLogs.onDetails) {
+        exportConnectionLog(connectionLogs.onDetails, 'syn_cookies_on_connections.csv');
+      } else {
+        alert('No connection data available. Please upload a file first.');
+      }
+    });
+  </script>
+</body>
+</html>
